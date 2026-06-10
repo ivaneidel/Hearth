@@ -19,6 +19,7 @@ export interface NetCallbacks {
   onPeerLeft(id: string): void;
   onPeerMove(id: string, x: number, y: number): void;
   onSignal(from: string, data: SignalData): void;
+  onChat(from: string, name: string, text: string): void;
 }
 
 const URL_KEY = "hearth_url";
@@ -63,11 +64,15 @@ export class Net {
     this.ws = new WebSocket(this.url);
 
     this.ws.onopen = () => {
+      // One deterministic first message. The server only announces our id in
+      // response to this, so there is never a leaked temp id. A rejoin that
+      // can't be restored degrades server-side into a fresh join.
       const oldId = sessionStorage.getItem(ID_KEY);
-      if (oldId) this.sendRaw({ type: "rejoin", id: oldId });
-      // Whether fresh or rejoining, (re)assert room membership once we have an id.
-      // The server treats a second join as a move-to-room; harmless on rejoin
-      // because rejoin restores the room itself, and join is idempotent enough.
+      if (oldId) {
+        this.sendRaw({ type: "rejoin", id: oldId, room: this.room!, name: this.name });
+      } else {
+        this.sendRaw({ type: "join", room: this.room!, name: this.name });
+      }
     };
 
     this.ws.onmessage = (e) => {
@@ -85,14 +90,11 @@ export class Net {
   private handle(msg: ServerMessage): void {
     switch (msg.type) {
       case "id": {
-        const isRejoin = sessionStorage.getItem(ID_KEY) === msg.id;
+        // Identity is now confirmed exactly once, in response to our
+        // join/rejoin. No join is triggered here.
         this.myId = msg.id;
         sessionStorage.setItem(ID_KEY, msg.id);
         this.cb.onReady(msg.id);
-        // Fresh connection (not a successful rejoin into a room): join now.
-        if (!isRejoin && this.room) {
-          this.sendRaw({ type: "join", room: this.room, name: this.name });
-        }
         break;
       }
       case "joined":
@@ -109,6 +111,9 @@ export class Net {
         break;
       case "signal":
         this.cb.onSignal(msg.from, msg.data);
+        break;
+      case "peer_chat":
+        this.cb.onChat(msg.from, msg.name, msg.text);
         break;
       case "error":
         console.warn("relay error:", msg.message);
@@ -139,6 +144,10 @@ export class Net {
 
   signal(to: string, data: SignalData): void {
     this.sendRaw({ type: "signal", to, data });
+  }
+
+  chat(text: string): void {
+    this.sendRaw({ type: "chat", text });
   }
 
   private sendRaw(data: ClientMessage): void {

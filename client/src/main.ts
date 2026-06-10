@@ -3,14 +3,14 @@
  * audio/overlay. The frame loop drives local movement, remote interpolation,
  * and the proximity logic (volume per peer + which peers receive our screen).
  */
-import { DEFAULT_ROOM, SPEED, SHARE_RADIUS } from "./config.ts";
+import { DEFAULT_ROOM, SPEED, HEARING_RADIUS } from "./config.ts";
 import { Net } from "./net.ts";
 import { Players } from "./player.ts";
 import { Renderer } from "./render.ts";
 import { Mesh } from "./rtc.ts";
 import { AudioPlayer, volumeForDistance } from "./audio.ts";
 import { collides, spawnPoint } from "./world.ts";
-import { mountJoin, mountToolbar, ScreenOverlay } from "./ui.ts";
+import { mountJoin, mountToolbar, mountChat, ScreenOverlay } from "./ui.ts";
 
 const canvas = document.getElementById("stage") as HTMLCanvasElement;
 
@@ -65,6 +65,14 @@ function boot(name: string): void {
     onSignal(from, data) {
       mesh.onSignal(from, data);
     },
+    onChat(from, name, text) {
+      // Proximity chat: only show if the sender is within hearing range,
+      // measured from their latest known position.
+      const p = players?.peers.get(from);
+      if (!players || !p) return;
+      const d = Math.hypot(p.tx - players.me.x, p.ty - players.me.y);
+      if (d <= HEARING_RADIUS) chat.addMessage(name, text, false);
+    },
   });
 
   mesh = new Mesh(net, {
@@ -104,11 +112,21 @@ function boot(name: string): void {
     },
   });
 
+  // Chat panel. Sending echoes our own message locally (always visible) and
+  // relays it; receivers proximity-filter in onChat above.
+  const chat = mountChat({
+    onSend(text) {
+      net.chat(text);
+      chat.addMessage(name, text, true);
+    },
+  });
+
   net.connect(DEFAULT_ROOM, name);
 
   // ── Input ──────────────────────────────────────────────────────────────
   const keys = new Set<string>();
   const down = (e: KeyboardEvent) => {
+    if (chat.focused()) return; // typing — don't drive the avatar
     const k = e.key.toLowerCase();
     if (["w", "a", "s", "d", "arrowup", "arrowdown", "arrowleft", "arrowright"].includes(k)) {
       keys.add(k);
@@ -119,7 +137,24 @@ function boot(name: string): void {
   window.addEventListener("keydown", down);
   window.addEventListener("keyup", up);
 
-  // ── Loop ───────────────────────────────────────────────────────────────
+  // ── Proximity (volume + screen-share gating) ─────────────────────────────
+  // Runs on a timer, NOT in the rAF loop — rAF pauses on a backgrounded tab,
+  // which would freeze volume at the last value (you'd keep hearing someone who
+  // walked away). Distance uses each peer's latest received position (tx,ty),
+  // so it's correct even without visual interpolation running.
+  setInterval(() => {
+    if (!players) return;
+    const me = players.me;
+    const distances = new Map<string, number>();
+    for (const p of players.peers.values()) {
+      const d = Math.hypot(p.tx - me.x, p.ty - me.y);
+      distances.set(p.id, d);
+      audio.setVolume(p.id, volumeForDistance(d));
+    }
+    mesh.updateShareTargets(distances);
+  }, 150);
+
+  // ── Render loop (visuals + input + interpolation) ────────────────────────
   let last = performance.now();
   function frame(now: number): void {
     const dt = Math.min((now - last) / 1000, 0.05);
@@ -145,16 +180,6 @@ function boot(name: string): void {
       }
 
       players.interpolate(dt);
-
-      // Proximity: per-peer volume + which peers get our screen.
-      const inRange = new Set<string>();
-      for (const p of players.peers.values()) {
-        const d = players.distanceTo(p);
-        audio.setVolume(p.id, volumeForDistance(d));
-        if (d <= SHARE_RADIUS) inRange.add(p.id);
-      }
-      mesh.updateShareTargets(inRange);
-
       net.tick();
       renderer.draw(players, incomingShares);
     }

@@ -25,10 +25,16 @@ export type SignalData =
 
 // ─── Client → Server ────────────────────────────────────────────────────────
 
-/** Resume a previous session id after a reload/drop (ghost grace). */
+/**
+ * Resume a previous session id after a reload/drop (ghost grace). Carries
+ * room+name so a rejoin that can't be restored degrades cleanly into a fresh
+ * join — the server never hands out a leaked temp id.
+ */
 export interface RejoinMsg {
   type: "rejoin";
   id: ClientId;
+  room: RoomId;
+  name: string;
 }
 
 /** Enter a room. Server replies `joined` and tells existing peers `peer_joined`. */
@@ -36,6 +42,12 @@ export interface JoinMsg {
   type: "join";
   room: RoomId;
   name: string;
+}
+
+/** Send a chat message to the room. Visibility is proximity-filtered client-side. */
+export interface ChatMsg {
+  type: "chat";
+  text: string;
 }
 
 /** Broadcast my new position to everyone else in the room. Fire-and-forget. */
@@ -52,7 +64,7 @@ export interface SignalMsg {
   data: SignalData;
 }
 
-export type ClientMessage = RejoinMsg | JoinMsg | MoveMsg | SignalMsg;
+export type ClientMessage = RejoinMsg | JoinMsg | MoveMsg | SignalMsg | ChatMsg;
 
 // ─── Server → Client ──────────────────────────────────────────────────────��─
 
@@ -97,6 +109,14 @@ export interface SignalRelayMsg {
   data: SignalData;
 }
 
+/** A chat message relayed from a room peer. Receiver decides if it's in range. */
+export interface PeerChatMsg {
+  type: "peer_chat";
+  from: ClientId;
+  name: string;
+  text: string;
+}
+
 /** Recoverable error (e.g. malformed message). */
 export interface ErrorMsg {
   type: "error";
@@ -110,6 +130,7 @@ export type ServerMessage =
   | PeerLeftMsg
   | PeerMoveMsg
   | SignalRelayMsg
+  | PeerChatMsg
   | ErrorMsg;
 
 /** Public info about a peer, shared on join. */

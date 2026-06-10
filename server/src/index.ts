@@ -4,11 +4,12 @@
  * Evolved from html-games `ws-bridge`: the 1:1 `pairs` map became an
  * N-player `rooms` map, and a `signal` passthrough was added so peers can
  * negotiate WebRTC (audio + screen share) over this same socket. The relay
- * still holds NO application state — positions live only on clients and are
- * fire-and-forget broadcast; media flows peer-to-peer, never through here.
+ * still holds NO application state beyond ephemeral room membership and a
+ * last-known position used only to seed late joiners — media flows P2P.
  *
- * Reused verbatim in spirit from ws-bridge: 4-digit id generator, the
- * ghost-TTL rejoin grace, and "non-OPEN socket counts as a rejoin target".
+ * Handshake is deterministic: the server assigns an id internally on connect
+ * but does NOT announce it until the client explicitly `join`s or `rejoin`s.
+ * This avoids the temp-id race that used to leak an orphan avatar at (0,0).
  *
  * Runs on Node's native TypeScript (no build step). `node src/index.ts`.
  */
@@ -23,7 +24,8 @@ import type {
 } from "../../shared/protocol.ts";
 
 const PORT = Number(process.env.PORT) || 8090;
-const GHOST_TTL = 60_000; // grace period (ms) for a dropped client to rejoin
+const GHOST_TTL = 60_000; // grace (ms) for a dropped client to rejoin
+const LEFT_DELAY = 2_500; // wait before telling others someone left (reload grace)
 
 /** Per-connection state we hang off each socket. */
 interface Conn extends WebSocket {
@@ -34,9 +36,20 @@ interface Conn extends WebSocket {
   y: number;
 }
 
+/** State retained for a dropped client during its rejoin grace. */
+interface Ghost {
+  room?: RoomId;
+  name: string;
+  x: number;
+  y: number;
+  leftSent: boolean; // have we already told the room they left?
+  leftTimer: NodeJS.Timeout;
+  purgeTimer: NodeJS.Timeout;
+}
+
 const clients = new Map<ClientId, Conn>(); // id -> live socket
 const rooms = new Map<RoomId, Set<ClientId>>(); // room -> member ids
-const ghosts = new Map<ClientId, NodeJS.Timeout>(); // dropped-but-not-purged
+const ghosts = new Map<ClientId, Ghost>(); // dropped-but-not-purged
 
 const wss = new WebSocketServer({ port: PORT, host: "0.0.0.0" });
 
@@ -66,6 +79,31 @@ function peerInfo(c: Conn): PeerInfo {
   return { id: c.id, name: c.name, x: c.x, y: c.y };
 }
 
+/** Members of `room` other than `exceptId`, as PeerInfo. */
+function roomPeers(room: RoomId, exceptId: ClientId): PeerInfo[] {
+  const members = rooms.get(room);
+  if (!members) return [];
+  return [...members]
+    .filter((pid) => pid !== exceptId)
+    .map((pid) => clients.get(pid))
+    .filter((c): c is Conn => !!c)
+    .map(peerInfo);
+}
+
+/** Place a client into a room: confirm id, send the peer snapshot, announce. */
+function doJoin(ws: Conn, room: RoomId, name: string): void {
+  ws.room = room;
+  ws.name = (name || "anon").slice(0, 24);
+  if (!rooms.has(room)) rooms.set(room, new Set());
+  const members = rooms.get(room)!;
+  const peers = roomPeers(room, ws.id);
+  members.add(ws.id);
+  send(ws, { type: "id", id: ws.id });
+  send(ws, { type: "joined", room, self: ws.id, peers });
+  broadcast(room, { type: "peer_joined", peer: peerInfo(ws) }, ws.id);
+  console.log(`${ws.id} joined room ${room} (${members.size} present)`);
+}
+
 /** Remove a client from its room, notifying the rest. */
 function leaveRoom(id: ClientId): void {
   const c = clients.get(id);
@@ -82,21 +120,29 @@ function leaveRoom(id: ClientId): void {
 
 /** Final cleanup once the ghost grace expires. */
 function purge(id: ClientId): void {
+  const g = ghosts.get(id);
   ghosts.delete(id);
-  leaveRoom(id);
+  // The id may still sit in its room set (kept during ghost). Tidy it up.
+  if (g?.room) {
+    const members = rooms.get(g.room);
+    if (members) {
+      members.delete(id);
+      if (members.size === 0) rooms.delete(g.room);
+      else if (!g.leftSent) broadcast(g.room, { type: "peer_left", id }, id);
+    }
+  }
   clients.delete(id);
   console.log(`Purged ghost: ${id}`);
 }
 
 wss.on("connection", (socket) => {
   const ws = socket as Conn;
-  ws.id = generateId();
+  ws.id = generateId(); // assigned now, announced only on join/rejoin
   ws.name = "anon";
   ws.x = 0;
   ws.y = 0;
   clients.set(ws.id, ws);
-  console.log(`Client connected: ${ws.id}`);
-  send(ws, { type: "id", id: ws.id });
+  console.log(`Client connected (pending): ${ws.id}`);
 
   ws.on("message", (raw) => {
     let data: ClientMessage;
@@ -107,74 +153,61 @@ wss.on("connection", (socket) => {
     }
 
     switch (data.type) {
-      // ── REJOIN: adopt a prior id within the ghost grace ──────────────────
+      // ── REJOIN: adopt a prior id within the grace, else fresh join ───────
       case "rejoin": {
         const oldId = data.id;
-        if (oldId === ws.id) return;
-
-        const isGhost = ghosts.has(oldId);
-        // On fast reloads the old socket may not have fired 'close' yet —
-        // any non-OPEN connection is a valid rejoin target (from ws-bridge).
+        const ghost = ghosts.get(oldId);
         const stale = clients.get(oldId);
-        const isStale = !!stale && stale.readyState !== WebSocket.OPEN;
-        if (!isGhost && !isStale) return; // unknown id → keep fresh id
+        const isStale = !!stale && stale !== ws && stale.readyState !== WebSocket.OPEN;
 
-        if (isGhost) {
-          clearTimeout(ghosts.get(oldId)!);
-          ghosts.delete(oldId);
-        } else if (stale) {
-          try {
-            stale.terminate();
-          } catch {
-            /* already gone */
+        if (oldId !== ws.id && (ghost || isStale)) {
+          if (ghost) {
+            clearTimeout(ghost.leftTimer);
+            clearTimeout(ghost.purgeTimer);
+            ghosts.delete(oldId);
           }
+          if (isStale && stale) {
+            try { stale.terminate(); } catch { /* already gone */ }
+          }
+
+          const restoreRoom = ghost?.room ?? stale?.room;
+          ws.name = ghost?.name ?? stale?.name ?? data.name;
+          ws.x = ghost?.x ?? stale?.x ?? 0;
+          ws.y = ghost?.y ?? stale?.y ?? 0;
+
+          clients.delete(ws.id); // drop the temp id
+          ws.id = oldId;
+          clients.set(oldId, ws);
+          send(ws, { type: "id", id: oldId });
+          console.log(`Client rejoined: ${oldId}`);
+
+          if (restoreRoom) {
+            ws.room = restoreRoom;
+            if (!rooms.has(restoreRoom)) rooms.set(restoreRoom, new Set());
+            const members = rooms.get(restoreRoom)!;
+            const peers = roomPeers(restoreRoom, oldId);
+            members.add(oldId);
+            send(ws, { type: "joined", room: restoreRoom, self: oldId, peers });
+            // Only re-announce if the room had already been told we left.
+            const announced = ghost?.leftSent ?? true;
+            if (announced) {
+              broadcast(restoreRoom, { type: "peer_joined", peer: peerInfo(ws) }, oldId);
+            }
+          } else {
+            doJoin(ws, data.room, data.name);
+          }
+          return;
         }
 
-        // Inherit the old connection's identity + room membership.
-        const inheritedRoom = stale?.room;
-        const inheritedName = stale?.name ?? ws.name;
-        const inheritedX = stale?.x ?? ws.x;
-        const inheritedY = stale?.y ?? ws.y;
-
-        clients.delete(ws.id); // drop the temp id
-        ws.id = oldId;
-        ws.name = inheritedName;
-        ws.x = inheritedX;
-        ws.y = inheritedY;
-        clients.set(oldId, ws);
-        send(ws, { type: "id", id: oldId });
-
-        if (inheritedRoom && rooms.has(inheritedRoom)) {
-          ws.room = inheritedRoom;
-          rooms.get(inheritedRoom)!.add(oldId);
-          const peers = [...rooms.get(inheritedRoom)!]
-            .filter((pid) => pid !== oldId)
-            .map((pid) => peerInfo(clients.get(pid)!))
-            .filter(Boolean);
-          send(ws, { type: "joined", room: inheritedRoom, self: oldId, peers });
-          broadcast(inheritedRoom, { type: "peer_joined", peer: peerInfo(ws) }, oldId);
-        }
-        console.log(`Client rejoined: ${oldId}`);
+        // Not restorable (cold server, expired grace): fresh join, no leak.
+        doJoin(ws, data.room, data.name);
         return;
       }
 
-      // ── JOIN: enter a room ───────────────────────────────────────────────
+      // ── JOIN: fresh entry ────────────────────────────────────────────────
       case "join": {
         if (ws.room) leaveRoom(ws.id);
-        ws.room = data.room;
-        ws.name = (data.name || "anon").slice(0, 24);
-        if (!rooms.has(data.room)) rooms.set(data.room, new Set());
-        const members = rooms.get(data.room)!;
-
-        const peers = [...members]
-          .map((pid) => clients.get(pid))
-          .filter((c): c is Conn => !!c)
-          .map(peerInfo);
-
-        members.add(ws.id);
-        send(ws, { type: "joined", room: data.room, self: ws.id, peers });
-        broadcast(data.room, { type: "peer_joined", peer: peerInfo(ws) }, ws.id);
-        console.log(`${ws.id} joined room ${data.room} (${members.size} present)`);
+        doJoin(ws, data.room, data.name);
         return;
       }
 
@@ -184,6 +217,15 @@ wss.on("connection", (socket) => {
         ws.x = data.x;
         ws.y = data.y;
         broadcast(ws.room, { type: "peer_move", id: ws.id, x: data.x, y: data.y }, ws.id);
+        return;
+      }
+
+      // ── CHAT: broadcast to room (receivers proximity-filter) ─────────────
+      case "chat": {
+        if (!ws.room) return;
+        const text = String(data.text).slice(0, 500);
+        if (!text.trim()) return;
+        broadcast(ws.room, { type: "peer_chat", from: ws.id, name: ws.name, text }, ws.id);
         return;
       }
 
@@ -201,11 +243,23 @@ wss.on("connection", (socket) => {
     const id = ws.id;
     if (!id || clients.get(id) !== ws) return; // superseded by a rejoin
     clients.delete(id);
-    console.log(`Client disconnected: ${id} — entering ghost state`);
-    // Tell the room immediately; keep membership alive for GHOST_TTL so a
-    // reload can silently rejoin without others seeing a flicker.
-    if (ws.room) broadcast(ws.room, { type: "peer_left", id }, id);
-    ghosts.set(id, setTimeout(() => purge(id), GHOST_TTL));
+    console.log(`Client disconnected: ${id} — ghost`);
+    // Keep room membership alive; defer the "left" broadcast so a quick reload
+    // rejoins silently (no blink-out for others). Purge after the full TTL.
+    const g: Ghost = {
+      room: ws.room,
+      name: ws.name,
+      x: ws.x,
+      y: ws.y,
+      leftSent: false,
+      leftTimer: setTimeout(() => {
+        const gg = ghosts.get(id);
+        if (gg && gg.room) broadcast(gg.room, { type: "peer_left", id }, id);
+        if (gg) gg.leftSent = true;
+      }, LEFT_DELAY),
+      purgeTimer: setTimeout(() => purge(id), GHOST_TTL),
+    };
+    ghosts.set(id, g);
   });
 });
 

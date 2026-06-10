@@ -6,7 +6,7 @@
  * avoids the long-standing Chrome bug where remote WebRTC streams routed
  * through WebAudio produce silence. Distance→volume gives the Gather fade.
  */
-import { HEARING_RADIUS, FULL_VOLUME_RADIUS } from "./config.ts";
+import { HEARING_RADIUS, FULL_VOLUME_RADIUS, MAX_VOLUME } from "./config.ts";
 
 /** Smoothstep falloff: 1 inside FULL_VOLUME_RADIUS, 0 beyond HEARING_RADIUS. */
 export function volumeForDistance(dist: number): number {
@@ -38,7 +38,7 @@ export class AudioPlayer {
 
   setVolume(peerId: string, v: number): void {
     const el = this.els.get(peerId);
-    if (el) el.volume = this.muted ? 0 : Math.max(0, Math.min(1, v));
+    if (el) el.volume = this.muted ? 0 : Math.max(0, Math.min(1, v)) * MAX_VOLUME;
   }
 
   /** Mute all remote audio (does not affect our outgoing mic). */

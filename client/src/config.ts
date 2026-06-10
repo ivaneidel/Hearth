@@ -13,13 +13,22 @@ export const SPEED = 200;
 export const MOVE_INTERVAL = 80;
 
 /** Audio fades to silence at this distance (pixels). The core "Gather feel". */
-export const HEARING_RADIUS = 5 * TILE;
+export const HEARING_RADIUS = 3.5 * TILE;
 
 /** Volume is full within this distance, then fades to 0 by HEARING_RADIUS. */
-export const FULL_VOLUME_RADIUS = 1.5 * TILE;
+export const FULL_VOLUME_RADIUS = 1 * TILE;
 
-/** A peer's screen share is only sent/shown within this distance (pixels). */
-export const SHARE_RADIUS = 3 * TILE;
+/** Ceiling on remote volume — keeps "right next to you" from being too loud. */
+export const MAX_VOLUME = 0.7;
+
+/** A peer's screen share starts being sent/shown within this distance (pixels). */
+export const SHARE_RADIUS = 2.5 * TILE;
+
+/**
+ * Hysteresis: once sharing to a peer, keep sending until they pass this larger
+ * distance. Prevents renegotiation flapping when walking along the boundary.
+ */
+export const SHARE_DROP_RADIUS = SHARE_RADIUS * 1.3;
 
 /** Avatar radius in pixels. */
 export const AVATAR_R = 13;

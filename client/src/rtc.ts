@@ -8,7 +8,7 @@
  * Glare (both sides offering at once) is handled by the standard "perfect
  * negotiation" pattern; the peer with the higher id is "polite" and yields.
  */
-import { ICE_SERVERS } from "./config.ts";
+import { ICE_SERVERS, SHARE_RADIUS, SHARE_DROP_RADIUS } from "./config.ts";
 import type { Net } from "./net.ts";
 import type { SignalData } from "../../shared/protocol.ts";
 
@@ -98,8 +98,16 @@ export class Mesh {
       if (e.track.kind === "audio") {
         this.cb.onRemoteAudio(peerId, stream);
       } else {
-        this.cb.onRemoteScreen(peerId, stream);
-        e.track.addEventListener("ended", () => this.cb.onRemoteScreen(peerId, null));
+        // A screen-share video track. `removeTrack` on the sender (stop, or
+        // walking out of range) fires `mute` on the receiver — NOT `ended` —
+        // so we must hide on mute and re-show on unmute, else the tile sticks.
+        const track = e.track;
+        const show = () => this.cb.onRemoteScreen(peerId, stream);
+        const hide = () => this.cb.onRemoteScreen(peerId, null);
+        show();
+        track.addEventListener("mute", hide);
+        track.addEventListener("unmute", show);
+        track.addEventListener("ended", hide);
       }
     };
 
@@ -174,14 +182,19 @@ export class Mesh {
   }
 
   /**
-   * Reconcile which peers should currently receive our screen, given a set
-   * of in-range peer ids. Adds/removes the video sender per peer, which
-   * triggers renegotiation only on actual change.
+   * Reconcile which peers should currently receive our screen, given the
+   * current distance to each peer. Uses hysteresis (start at SHARE_RADIUS,
+   * keep until SHARE_DROP_RADIUS) so edge-walking doesn't flap renegotiation.
+   * Adds/removes the video sender per peer only on actual change.
    */
-  updateShareTargets(inRange: Set<string>): void {
+  updateShareTargets(distances: Map<string, number>): void {
     if (!this.screenStream) return;
     for (const p of this.peers.values()) {
-      this.setScreenSentTo(p, inRange.has(p.id));
+      const d = distances.get(p.id);
+      if (d === undefined) continue;
+      const sending = !!p.screenSender;
+      const shouldSend = sending ? d <= SHARE_DROP_RADIUS : d <= SHARE_RADIUS;
+      this.setScreenSentTo(p, shouldSend);
     }
   }
 
